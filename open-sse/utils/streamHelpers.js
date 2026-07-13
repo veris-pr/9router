@@ -100,6 +100,123 @@ function cleanUsagePayload(payload) {
   return cleaned;
 }
 
+/**
+ * Peek the leading bytes of an NDJSON (Ollama) upstream stream to detect an
+ * in-band error emitted with HTTP 200 before any content is generated.
+ *
+ * Ollama Cloud reports usage/rate limits mid-response: once the x-ndjson body
+ * has started the HTTP status can no longer change, so the error arrives as a
+ * `{"error":"..."}` line in the body instead of a 4xx status. Without this
+ * peek the error line is silently dropped by the ollama→openai translator
+ * (it has no `message`/`done`), the request looks successful, and account
+ * fallback never fires.
+ *
+ * Returns { earlyError, response }:
+ *  - earlyError: the error string if one appears before any content line, else null.
+ *    When set, the reader is cancelled and `response` is null — the caller should
+ *    treat it as a provider error and fall over to the next account.
+ *  - response: a reconstructed Response replaying the peeked bytes, so the caller
+ *    can stream it normally when no early error is present.
+ *
+ * @param {Response} providerResponse
+ * @param {{ maxBytes?: number }} [opts]
+ * @returns {Promise<{ earlyError: string|null, response: Response|null }>}
+ */
+export async function peekNdjsonError(providerResponse, { maxBytes = 65536 } = {}) {
+  if (!providerResponse?.body) return { earlyError: null, response: providerResponse };
+
+  const reader = providerResponse.body.getReader();
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  const consumed = [];
+  let textBuf = "";
+  let peeked = 0;
+  let earlyError = null;
+
+  // Classify one NDJSON line: "error" (in-band error), "content" (generation
+  // started or a normal terminal chunk), or null (empty/warmup/unparseable).
+  const classify = (line) => {
+    const t = line.trim();
+    if (!t || t[0] !== "{") return null;
+    let obj;
+    try {
+      obj = JSON.parse(t);
+    } catch {
+      return null;
+    }
+    if (obj.error) {
+      earlyError = typeof obj.error === "string" ? obj.error : JSON.stringify(obj.error);
+      return "error";
+    }
+    const msg = obj.message;
+    const hasContent = msg && (msg.content || msg.thinking || (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0));
+    if (hasContent || obj.done) return "content";
+    return null;
+  };
+
+  let decided = false;
+  while (!decided) {
+    let result;
+    try {
+      result = await reader.read();
+    } catch {
+      break; // upstream error while peeking — fall through, caller handles empty stream
+    }
+    const { value, done } = result;
+    if (done) {
+      // Stream ended: inspect any remaining buffered line (covers a non-streaming
+      // single JSON object with no trailing newline).
+      textBuf += decoder.decode();
+      if (classify(textBuf)) decided = true;
+      break;
+    }
+    consumed.push(value);
+    peeked += value.byteLength || value.length || 0;
+    textBuf += decoder.decode(value, { stream: true });
+
+    const lines = textBuf.split("\n");
+    // Only inspect complete lines (skip the trailing partial)
+    for (let i = 0; i < lines.length - 1; i++) {
+      if (classify(lines[i])) { decided = true; break; }
+    }
+    if (peeked >= maxBytes) break;
+  }
+
+  if (earlyError) {
+    reader.cancel().catch(() => {});
+    return { earlyError, response: null };
+  }
+
+  // Reconstruct the stream: replay the peeked bytes, then drain the rest of the reader.
+  const replay = new ReadableStream({
+    start(controller) {
+      for (const c of consumed) controller.enqueue(c);
+    },
+    async pull(controller) {
+      try {
+        const { value, done } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(value);
+      } catch (e) {
+        controller.error(e);
+      }
+    },
+    cancel(reason) {
+      reader.cancel(reason).catch(() => {});
+    }
+  });
+
+  // Preserve upstream headers but drop framing headers that no longer match the
+  // reconstructed (already-decoded, unbounded) body.
+  const headers = new Headers(providerResponse.headers);
+  headers.delete("content-length");
+  headers.delete("content-encoding");
+  const response = new Response(replay, { status: providerResponse.status, headers });
+  return { earlyError: null, response };
+}
+
 // Format output as SSE
 export function formatSSE(data, sourceFormat) {
   if (data === null || data === undefined) return "data: null\n\n";

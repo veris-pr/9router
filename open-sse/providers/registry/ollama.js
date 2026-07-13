@@ -21,6 +21,9 @@ export default {
     format: "ollama",
   },
   models: [
+    { id: "glm-5.2:cloud", name: "GLM 5.2" },
+    { id: "kimi-k2.7-code:cloud", name: "Kimi K2.7 Code" },
+    { id: "kimi-k2.6:cloud", name: "Kimi K2.6" },
     { id: "gpt-oss:120b", name: "GPT OSS 120B" },
     { id: "kimi-k2.5", name: "Kimi K2.5" },
     { id: "glm-5", name: "GLM 5" },
